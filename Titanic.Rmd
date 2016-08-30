@@ -1,0 +1,291 @@
+---
+title: "Titanic Exploration and XGBoost"
+author: "Amit Srivastava"
+date: "29 August 2016"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(warning=FALSE) #Added by me to remove Warning messages from Knitted document
+knitr::opts_chunk$set(message=FALSE) #Added by me to remove Warning messages from Knitted document
+```
+###Introduction
+This report contains  
+1. Elementary Data Exploration on the Titanic Dataset   
+2. Analysis of Feature Importance  
+3. Prediction using XGBoost  
+
+Hope to build upon this in the future versions
+
+
+######Load the required Libraries
+
+```{r Libraries, results=F, message=F}
+library(stringr)
+library(ggplot2)
+library(dplyr)
+library(dummies)
+library(caret)
+library(Boruta)
+library(xgboost)
+```
+
+
+
+```{r Read Data}
+train <- read.csv("D:/amit/Data Science/Kaggle/Titanic/train.csv", stringsAsFactors=FALSE)
+test <- read.csv("D:/amit/Data Science/Kaggle/Titanic/test.csv", stringsAsFactors=FALSE)
+```
+
+Join together the two datasets. Add an IsTrain column to indicate if the row is from Train or Test 
+```{r }
+train$IsTrain <- TRUE
+test$IsTrain <- FALSE
+test$Survived <- NA
+combi <- rbind(train,test)
+```
+
+
+Change a couple of obvious features into factors
+```{r}
+combi$Survived <- as.factor(combi$Survived)
+combi$Sex <- as.factor(combi$Sex)
+```
+
+Check for blanks and NAs which will need to be fixed.
+```{r }
+#Check blanks
+sapply(combi,function(x){sum(ifelse(str_trim(x)=="",1,0))})
+sapply(combi,function(x){sum(ifelse(is.na(x),1,0))})
+```
+1014 values for Cabin are blanks. This is too high. Need to drop???  
+2 Embarked values are blank.  
+263 values in Age are NAs.  
+418 Survived are NAs. But those are just the rows from test data, so they are OK  
+
+####Imputations
+######Lets first check the blank values in Embarked    
+
+```{r}
+table(combi$Embarked)
+combi[combi$Embarked=="",]
+```
+
+Both passenger have ticket nbr 113572. Ideally they should be family member. But from Sibsp or Parch, it does not seem so.
+
+```{r}
+combi[combi$Ticket=="113572",]
+```
+No other passengers on this ticket.
+
+```{r}
+ggplot(combi) +geom_boxplot(aes(x=factor(Embarked),y=Fare)) + facet_wrap("Pclass")
+```
+  
+  The 1st class fare (80)paid by them suggests that they may have Embarked at "C". So we will impute this blank value with C
+
+```{r}
+combi[combi$Embarked=="","Embarked"] ="C"
+```
+
+######Lets check tha Age NAs
+We will use the Name title to extract information about Age.  
+
+So lets analyze the Titles.
+
+```{r}
+#Extract Titles
+NameSplit <- strsplit(combi[,"Name"],("[.,]"))
+Title <-sapply(NameSplit, "[[", 2) 
+Title <- as.data.frame(Title)
+combi$Title <- (str_trim(Title$Title))
+
+table(combi$Title)
+```
+
+Too many titles. Lets combine the "Royalties" into one group.
+```{r}
+combi[!combi$Title %in% c("Mr","Mrs","Miss","Master"),"Title"] <- "Royalty"
+table(combi$Title)
+```
+
+How does it look on a chart?  
+```{r}
+ggplot(combi) + geom_density(aes(x=Age)) + facet_grid("Title")
+```
+  Chart shows that the median may be a good measure to impute NAs.  
+
+```{r}
+# NAs for Mr.
+combi[combi$Title=="Mr" & is.na(combi$Age),"Age"] <- median(combi[combi$Title=="Mr",]$Age,na.rm=TRUE)      
+
+# NAs for Miss.
+combi[combi$Title=="Miss" & is.na(combi$Age),"Age"] <- median(combi[combi$Title=="Miss",]$Age,na.rm=TRUE)      
+
+# NAs for Mrs.
+combi[combi$Title=="Mrs" & is.na(combi$Age),"Age"] <- median(combi[combi$Title=="Mrs",]$Age,na.rm=TRUE)      
+
+# NAs for Royalty.
+combi[combi$Title=="Royalty" & is.na(combi$Age),"Age"] <- median(combi[combi$Title=="Royalty",]$Age,na.rm=TRUE)   
+
+# NAs for Master.
+combi[combi$Title=="Master" & is.na(combi$Age),"Age"] <- median(combi[combi$Title=="Master",]$Age,na.rm=TRUE)      
+```
+
+We can now drop Name and Passenger Id  
+
+```{r}
+combi$Name <- NULL
+
+combi$PassengerId <- NULL
+```
+
+Proportion of each Sex Surviving  
+```{r}
+sex_survived_df <- with(subset(combi,combi$IsTrain==TRUE), prop.table(table(Sex,Survived),1))
+sex_survived_df <- as.data.frame(sex_survived_df)
+ggplot(sex_survived_df) + geom_bar(aes(x=Sex,y=Freq, fill=Survived),stat="identity" )
+rm(sex_survived_df)
+```
+
+
+Proportion of each Title Surviving
+
+```{r}
+Title_survived_df <- with(subset(combi,combi$IsTrain==TRUE), prop.table(table(Title,Survived),1))
+Title_survived_df <- as.data.frame(Title_survived_df)
+ggplot(Title_survived_df) + geom_bar(aes(x=Title,y=Freq, fill=Survived),stat="identity" )
+rm(Title_survived_df)
+```
+
+#####Categorize Age into different bins 0-15 15-30 30-50,50+
+```{r}
+fn_agecat <- function (x){
+  ifelse((x>=0 & x<=15) ,"A",
+         (ifelse((x>15 & x<=30), "B",
+                 (ifelse((x>30 & x<=50),"C","D")
+                 )
+         )
+         )
+  )
+}
+
+combi$AgeCategory <- fn_agecat(combi$Age)
+combi$AgeCategory <- as.factor((combi$AgeCategory))
+```
+
+
+Proportion of each Age Category Surviving
+```{r}
+Age_survived_df <- with(subset(combi,combi$IsTrain==TRUE), prop.table(table(AgeCategory,Survived),1))
+Age_survived_df <- as.data.frame(Age_survived_df)
+ggplot(Age_survived_df) + geom_bar(aes(x=AgeCategory,y=Freq, fill=Survived),stat="identity",position="dodge" )
+```
+
+
+####Feature Importance using Boruta
+```{r}
+df_for_boruta <- subset(combi,combi$IsTrain==TRUE)
+df_for_boruta$Age <- NULL
+df_for_boruta$Ticket <- NULL
+df_for_boruta$Cabin <- NULL
+df_for_boruta$Embarked <- factor(df_for_boruta$Embarked)
+df_for_boruta$IsTrain <- NULL
+df_for_boruta$Title <- factor(df_for_boruta$Title)
+
+df_factors <- subset(df_for_boruta,select=c("Sex","Embarked","Title","AgeCategory"))
+dmy <- dummyVars("~." ,data=df_factors,fullRank = TRUE)
+df_factors <- data.frame(predict(dmy,df_factors))
+
+df_for_boruta <- df_for_boruta[,!names(df_for_boruta) %in% c("Sex","Embarked","Title","AgeCategory")]
+df_for_boruta <- bind_cols(df_for_boruta,df_factors)
+
+boruta_features <- Boruta(data=df_for_boruta,Survived~.,doTrace=2)
+boruta_features$finalDecision
+```
+All features are deemed important
+Pclass         SibSp         Parch          Fare      Sex.male    Embarked.Q    Embarked.S 
+
+Title.Miss      Title.Mr     Title.Mrs Title.Royalty AgeCategory.B AgeCategory.C AgeCategory.D 
+
+
+###XGBoost
+
+We will use the dataframe created for Boruta as it is already dummyfied and non essential features have been removed
+```{r}
+train_xgBoost <- df_for_boruta
+
+train_xgBoost_Survived_label <- train_xgBoost$Survived
+
+train_xgBoost$Survived <- NULL
+```
+
+####Caret CrossValidation
+```{r Caret}
+xgb.cv.ctrl <- trainControl(method = "repeatedcv", repeats = 1,number = 5,
+                            #summaryFunction = twoClassSummary,
+                            #classProbs = TRUE,
+                            allowParallel=TRUE
+                            )
+
+xgb.grid <- expand.grid(nrounds = c(300,500,1000),
+                        eta = c(0.05,0.1,0.2) ,
+                        max_depth = c(6,8,10),
+                        gamma=1,
+                        colsample_bytree=1,
+                        min_child_weight=1
+)
+Sys.time()
+xgb_train_1 = train(
+  x=as.matrix(train_xgBoost),
+  y=train_xgBoost_Survived_label,
+  trControl = xgb.cv.ctrl,
+  tuneGrid = xgb.grid,
+  method = "xgbTree",
+  objective="reg:logistic"
+  # nthread=4,
+  #eval_metric="auc"
+  #early_stopping_rounds = 4,
+  #maximize=FALSE
+)
+Sys.time()
+xgb_train_1
+```
+Crossvalidation suggests  
+Accuracy was used to select the optimal model using  the largest value.
+The final values used for the model were nrounds = 300, max_depth = 6, eta = 0.1, gamma =
+ 1, colsample_bytree = 1 and min_child_weight = 1.   
+ 
+####Prediction
+Prepare test data set, same as the train data set was prepared
+```{r}
+
+
+xgb_test <- subset(combi,combi$IsTrain==FALSE)
+xgb_test$Age <- NULL
+xgb_test$Ticket <- NULL
+xgb_test$Cabin <- NULL
+xgb_test$Embarked <- factor(xgb_test$Embarked)
+xgb_test$IsTrain <- NULL
+xgb_test$Title <- factor(xgb_test$Title)
+df_factors <- subset(xgb_test,select=c("Sex","Embarked","Title","AgeCategory"))
+dmy <- dummyVars("~." ,data=df_factors,fullRank = TRUE)
+df_factors <- data.frame(predict(dmy,df_factors))
+
+xgb_test <- xgb_test[,!names(xgb_test) %in% c("Sex","Embarked","Title","AgeCategory")]
+xgb_test <- bind_cols(xgb_test,df_factors)
+xgb_test$Survived <- NULL
+xgb_test <- data.matrix(xgb_test)
+```
+
+Now Predict
+```{r Prediction}
+Survived_Predict <- predict(xgb_train_1$finalModel,xgb_test)
+Survived_Predict <- ifelse(Survived_Predict<=0.5,1,0)
+```
+
+I have used a threshold level of 0.5 to convert the probabilities into classes.
+
+
+
